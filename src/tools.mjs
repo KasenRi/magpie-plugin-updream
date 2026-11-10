@@ -575,10 +575,17 @@ export function createTools(client) {
             confirm_model_ids: liveData?.confirm_model_ids ?? [],
             models: rawModels.map((m) =>
               omitUndefined({
-                id: m.id ?? m.model_id ?? m.model_name,
-                name: m.name ?? m.label ?? m.display_name,
+                id: m.value ?? m.id ?? m.model_id ?? m.model_name,
+                name: m.label ?? m.name ?? m.display_name,
                 available: m.available ?? m.enabled ?? (m.status !== undefined ? m.status === "active" : true),
-                tier: m.tier,
+                min_tier: m.min_tier ?? m.tier,
+                generate_types: m.generate_types,
+                durations: Array.isArray(m.durations) ? m.durations : undefined,
+                resolutions: m.resolutions,
+                aspect_ratios: m.aspect_ratios,
+                supports_audio: m.supports_audio,
+                output_formats: Array.isArray(m.output_formats) && m.output_formats.length ? m.output_formats : undefined,
+                bitrate_modes: Array.isArray(m.bitrate_modes) && m.bitrate_modes.length ? m.bitrate_modes : undefined,
               })
             ),
           };
@@ -762,7 +769,7 @@ export function createTools(client) {
         const payload = omitUndefined({
           model_name: resolved.model_name,
           prompt: resolved.prompt,
-          prompt_source: "agent",
+          prompt_source: "original", // web app sends "original" | "optimized"; anything else is HTTP 400
           project_id: projectId,
           node_id: nodeId,
           generate_type: resolved.generate_type,

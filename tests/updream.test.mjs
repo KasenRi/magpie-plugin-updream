@@ -519,6 +519,7 @@ test("parameter validation, schema defaults, sed2-5-draft, i2v adaptive ratio, a
   assert.equal(draftRes.model, "sed2-5-draft");
   assert.equal(draftRes.params_sent.model_name, "sed2-5");
   assert.equal(draftRes.params_sent.draft, true);
+  assert.equal(draftRes.params_sent.prompt_source, "original");
   assert.equal(draftRes.params_sent.resolution, "480p");
   assert.equal(draftRes.params_sent.aspect_ratio, "16:9");
   assert.equal(draftRes.params_sent.duration, 5);

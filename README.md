@@ -4,8 +4,10 @@
 
 ---
 
-> 📌 **状态 / Status**：v0.1.0 已在 magpie v0.1.3563 中加载并通过 MCP 调用验证，单元测试使用本地模拟服务器；接口由前端 JS 逆向得到，**尚未用真实账号完成端到端生成验证**，欢迎反馈。
-> Loaded and exercised via MCP in magpie v0.1.3563 and covered by mock-server tests; endpoints were reverse-engineered from the web bundle and **not yet verified end-to-end against a live account**.
+> 📌 **状态 / Status**：v0.1.1 已用真实账号端到端验证（2026-11-10，经 magpie v0.1.3563 的 MCP 端点调用）：`account`、`list_video_models live`、`estimate_credits`、`create_video`（Seedance 2.5 样片模式 480p 4s 文生视频，预估与实扣均为 340 积分）、`wait_task`（约 1 分钟出片，854×480 / 4.04s mp4）以及 token 刷新轮换均正常。
+> Verified end-to-end against a live account on 2026-11-10 through magpie's MCP endpoint: account, live model list, credit estimate, create_video (Seedance 2.5 draft, 480p, 4 s, t2v: 340 credits estimated = 340 charged), wait_task (~1 min, 854×480 4.04 s mp4) and refresh-token rotation.
+>
+> 实测与静态表的差异 / Live vs static table: live `GET /ai/video-models` returns `value` ids `sed2`, `sed2-5`, `sed2-fast`, `sed2-mini` (plus non-Seedance models); `sed2-5-draft` is a web-side variant (sent as `sed2-5` + `draft:true`); `wonder-ultra` / `wonder-pro` (导演专属) only appear for eligible accounts. Live config also lists `1080p` for `sed2-5` (the web UI only reaches it by promoting a draft) and `min_tier` (`pro` for sed2 / sed2-5 / sed2-mini, `origin` for sed2-fast). Use `list_video_models {"live": true}` to see what your account has.
 
 ## 🇨🇳 中文说明
 

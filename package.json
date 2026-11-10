@@ -1,6 +1,6 @@
 {
   "name": "opencode-updream",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unofficial Magpie / OpenCode tools plugin for UPdream (Bilibili AI video platform, Seedance 2.5 & 2.0 video generation)",
   "type": "module",
   "main": "./index.mjs",
