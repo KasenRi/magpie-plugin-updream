@@ -402,13 +402,13 @@ def _call_updream_tool_once(
     env = load_env(env_path)
     magpie_url = env.get("MAGPIE_URL", DEFAULT_MAGPIE_URL)
     api_key = env.get("MAGPIE_API_KEY")
-    if not api_key:
+    parsed = urllib.parse.urlparse(magpie_url)
+    # magpie answers loopback calls without a key; anything else needs one
+    if not api_key and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
         raise RuntimeError(
             f"Missing MAGPIE_API_KEY (checked env file '{env_path}' and environment variable MAGPIE_API_KEY). "
             f"Pass --env /path/to/.env or set UPDREAM_ENV."
         )
-
-    parsed = urllib.parse.urlparse(magpie_url)
     rpc_payload = {
         "jsonrpc": "2.0",
         "id": int(time.time() * 1000) % 1000000,
@@ -433,7 +433,7 @@ def _call_updream_tool_once(
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {api_key}",
+                **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
             },
         )
         resp = conn.getresponse()
