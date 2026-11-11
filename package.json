@@ -1,12 +1,13 @@
 {
   "name": "opencode-updream",
-  "version": "0.1.1",
-  "description": "Unofficial Magpie / OpenCode tools plugin for UPdream (Bilibili AI video platform, Seedance 2.5 & 2.0 video generation)",
+  "version": "0.2.0",
+  "description": "Unofficial Magpie / OpenCode tools & multi-account provider plugin for UPdream (Seedance, Kling, Wan, Vidu, Hailuo, PixVerse, HappyHorse, Omni, Veo video generation)",
   "type": "module",
   "main": "./index.mjs",
   "files": [
     "index.mjs",
     "src",
+    "skills",
     "docs/API.md",
     "README.md",
     "LICENSE"
@@ -26,8 +27,8 @@
   "magpie": {
     "name": "UPdream 视频生成",
     "summary": {
-      "en": "Generate AI videos with UPdream (Seedance 2.5 / 2.0 t2v, i2v, first-last frame, and multi-modal reference-to-video) as MCP tools",
-      "zh": "通过 UPdream 网页端账号调用 Seedance 2.5 / 2.0 文生视频、图生视频、首尾帧与多模态参考生视频 MCP 工具"
+      "en": "Generate AI videos with UPdream (multi-account provider UI + Seedance, Kling, Wan, Vidu, Hailuo, PixVerse, HappyHorse, Omni, Veo) as MCP tools",
+      "zh": "通过 UPdream 多账号调用 Seedance、可灵、万相、Vidu、海螺、PixVerse、HappyHorse 等视频生成 MCP 工具"
     }
   },
   "engines": {

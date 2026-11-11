@@ -863,3 +863,527 @@ test("reuses existing magpie-updream project from GET /projects, supports firstl
   assert.deepEqual(ref2v.params_sent.audio_urls, ["https://boss.hdslb.com/updream/audio/song.mp3"]);
 });
 
+
+test("config and auth hooks register UPdream provider with 0 models, oauth authorize, and background refresh", async (t) => {
+  const f = await startFakeUPdreamServer(t);
+  const isolatedTokenFile = join(f.tempDir, "should-never-exist.json");
+  const hooks = await UPdreamPlugin(
+    { directory: f.tempDir },
+    {
+      baseUrl: f.baseUrl,
+      tokenFile: isolatedTokenFile,
+    },
+  );
+
+  // 1. config hook registers provider.updream with 0 models
+  const cfg = {};
+  await hooks.config(cfg);
+  assert.equal(cfg.provider.updream.name, "UPdream");
+  assert.equal(cfg.provider.updream.models, undefined, "Must not declare any chat/video models");
+
+  // 2. auth hook structure & authorize()
+  assert.equal(hooks.auth.provider, "updream");
+  assert.equal(hooks.auth.methods.length, 1);
+  const method = hooks.auth.methods[0];
+  assert.equal(method.type, "api");
+  assert.equal(method.keyless, true);
+  assert.equal(method.prompts.length, 3);
+
+  const jwt1 = makeJwt({ sub: "987654", exp: Math.floor(Date.now() / 1000) + 1800 });
+  const authResAuto = await method.authorize({
+    access_token: `Bearer ${jwt1}`,
+    refresh_token: "  refresh_tok_1  ",
+    label: "",
+  });
+  assert.equal(authResAuto.type, "success");
+  assert.equal(authResAuto.access, jwt1);
+  assert.equal(authResAuto.refresh, "refresh_tok_1");
+  assert.equal(authResAuto.accountId, "uid-987654");
+  assert.ok(authResAuto.expires > Date.now());
+
+  const authResNamed = await method.authorize({
+    access_token: jwt1,
+    refresh_token: "refresh_tok_1",
+    label: "主号",
+  });
+  assert.equal(authResNamed.accountId, "主号");
+
+  // 3. auth.refresh() rotates JWT via UPdream API without writing tokenFile
+  const refreshed = await hooks.auth.refresh({
+    type: "oauth",
+    access: f.state.validAccessToken,
+    refresh: f.state.validRefreshToken,
+  });
+  assert.equal(refreshed.access, f.state.rotatedAccessToken);
+  assert.equal(refreshed.refresh, f.state.rotatedRefreshToken);
+  await assert.rejects(() => stat(isolatedTokenFile), "UI refresh must never write to tokenFile");
+
+  // 4. Backward compatibility: createTools(singleClient) direct invocation still works
+  const singleClient = new _internal.UPdreamClient({
+    baseUrl: f.baseUrl,
+    accessToken: f.state.rotatedAccessToken,
+    refreshToken: f.state.rotatedRefreshToken,
+    tokenFile: "",
+  });
+  const legacyTools = _internal.createTools(singleClient);
+  const accRes = await legacyTools.account.execute({});
+  assert.equal(accRes.selected, undefined, "createTools(singleClient) keeps raw legacy return shape");
+  assert.equal(accRes.credits.balance_credits, "1280.50");
+});
+
+test("MagpieAccountPool multi-account priority, slot refresh writeback, task-slot binding, and 404 fallback", async (t) => {
+  const f = await startFakeUPdreamServer(t);
+  const dataDir = await mkdtemp(join(tmpdir(), "magpie-pool-test-"));
+  t.after(async () => {
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const tokMain = futureJwt(3600, { sub: "u_main", tag: "1111" });
+  const tokSub = futureJwt(3600, { sub: "u_sub", tag: "2222" });
+  const tokSubExpired = futureJwt(15, { sub: "u_sub_exp", tag: "3333" }); // expires in 15s -> triggers proactive refresh
+  const tokSubRotated = futureJwt(7200, { sub: "u_sub_rot", tag: "4444" });
+  const tokOptions = futureJwt(3600, { sub: "u_opt", tag: "9999" });
+
+  const tasksByToken = new Map();
+  let nextMultiTaskId = 8001;
+
+  f.state.customHandler = async (record, sendJson) => {
+    if (record.method === "POST" && record.pathname === "/api/auth/refresh") {
+      if (record.body?.refresh_token === "ref_sub_exp") {
+        sendJson(200, { access_token: tokSubRotated, refresh_token: "ref_sub_rotated" });
+        return true;
+      }
+    }
+    const auth = (record.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const who =
+      auth === tokMain
+        ? { id: 1, name: "MainUser", bal: "5000.00", key: "main" }
+        : auth === tokSub || auth === tokSubRotated
+        ? { id: 2, name: "SubUser", bal: "1200.00", key: "sub" }
+        : auth === tokOptions
+        ? { id: 9, name: "OptUser", bal: "300.00", key: "opt" }
+        : null;
+    if (!who) {
+      sendJson(401, { detail: "Unknown bearer token" });
+      return true;
+    }
+
+    if (record.method === "GET" && record.pathname === "/api/auth/me") {
+      sendJson(200, { id: who.id, nickname: who.name });
+      return true;
+    }
+    if (record.method === "GET" && record.pathname === "/api/user/account") {
+      sendJson(200, { balance_credits: who.bal, membership: "max" });
+      return true;
+    }
+    if (record.method === "GET" && record.pathname === "/api/member/status") {
+      sendJson(200, { tier: "max" });
+      return true;
+    }
+    if (record.method === "GET" && record.pathname === "/api/projects") {
+      sendJson(200, { projects: [{ project_id: `proj_${who.key}`, name: "magpie-updream" }] });
+      return true;
+    }
+    if (record.method === "POST" && record.pathname.startsWith("/api/canvas-nodes/project/")) {
+      sendJson(200, { id: `node_${who.key}_1` });
+      return true;
+    }
+    if (record.method === "POST" && record.pathname === "/api/ai/generate-video/async") {
+      const tid = `t_${who.key}_${nextMultiTaskId++}`;
+      tasksByToken.set(tid, who.key);
+      sendJson(200, { task_id: tid, status: "pending" });
+      return true;
+    }
+    const taskMatch = record.pathname.match(/^\/api\/ai\/task\/([^/]+)$/);
+    if (record.method === "GET" && taskMatch) {
+      const tid = decodeURIComponent(taskMatch[1]);
+      const owner = tasksByToken.get(tid);
+      if (owner !== who.key) {
+        sendJson(404, { detail: "Task not found" });
+        return true;
+      }
+      sendJson(200, {
+        task_id: tid,
+        status: "completed",
+        progress: 100,
+        videos: [{ video_url: `https://boss.hdslb.com/updream/video/${tid}.mp4` }],
+      });
+      return true;
+    }
+    return false;
+  };
+
+  const authWrites = [];
+  const optionsTokenFile = join(dataDir, "legacy-options-token.json");
+  const hooks = await UPdreamPlugin(
+    {
+      directory: dataDir,
+      client: {
+        auth: {
+          async set(req) {
+            authWrites.push(req);
+            const cur = JSON.parse(await readFile(join(dataDir, "plugin-auth.json"), "utf8"));
+            cur[req.path.id] = req.body;
+            await writeFile(join(dataDir, "plugin-auth.json"), JSON.stringify(cur, null, 2));
+          },
+        },
+      },
+    },
+    {
+      baseUrl: f.baseUrl,
+      accessToken: tokOptions,
+      refreshToken: "ref_options",
+      tokenFile: optionsTokenFile,
+    },
+  );
+
+  // A. When UI has 0 accounts, seamlessly falls back to options
+  const fallbackRes = await hooks.tool.account.execute({});
+  assert.equal(fallbackRes.account, "options");
+  assert.deepEqual(fallbackRes.selected, { slot: "options", label: "options" });
+  assert.equal(fallbackRes.credits.balance_credits, "300.00");
+
+  // B. Populate two UI accounts in plugin-auth.json + logins.json + providers.json
+  await writeFile(
+    join(dataDir, "plugin-auth.json"),
+    JSON.stringify(
+      {
+        updream: {
+          type: "oauth",
+          access: tokMain,
+          refresh: "ref_main",
+          expires: Date.now() + 3600_000,
+          accountId: "主号",
+        },
+        "updream#sub2": {
+          type: "oauth",
+          access: tokSubExpired,
+          refresh: "ref_sub_exp",
+          expires: Date.now() + 15_000,
+          accountId: "uid-2002",
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  await writeFile(
+    join(dataDir, "logins.json"),
+    JSON.stringify([
+      { agent: "plugin:updream", home: "updream", first: true, on: true },
+      { agent: "plugin:updream", home: "updream#sub2", first: false, on: true },
+    ]),
+  );
+  await writeFile(
+    join(dataDir, "providers.json"),
+    JSON.stringify({
+      providers: [
+        {
+          id: "updream",
+          off: false,
+          accountNames: { "uid-2002": "二号机" },
+        },
+      ],
+    }),
+  );
+
+  // Default uses top enabled account ('主号')
+  const mainAcc = await hooks.tool.account.execute({});
+  assert.deepEqual(mainAcc.selected, { slot: "updream", label: "主号" });
+  assert.equal(mainAcc.credits.balance_credits, "5000.00");
+
+  // Explicit account selection by custom alias ('二号机') triggers proactive refresh -> client.auth.set writeback (not optionsTokenFile!)
+  const subAcc = await hooks.tool.account.execute({ account: "二号机" });
+  assert.deepEqual(subAcc.selected, { slot: "updream#sub2", label: "二号机" });
+  assert.equal(subAcc.credits.balance_credits, "1200.00");
+  assert.ok(authWrites.some((w) => w.path.id === "updream#sub2" && w.body.access === tokSubRotated));
+  await assert.rejects(() => stat(optionsTokenFile), "UI slot refresh must never touch options tokenFile");
+
+  // all_accounts: true lists both accounts with balances
+  const allAcc = await hooks.tool.account.execute({ all_accounts: true });
+  assert.equal(allAcc.accounts.length, 2);
+  assert.deepEqual(
+    allAcc.accounts.map((a) => ({ label: a.label, bal: a.credits.balance_credits, first: a.first })),
+    [
+      { label: "主号", bal: "5000.00", first: true },
+      { label: "二号机", bal: "1200.00", first: false },
+    ],
+  );
+
+  // C. Submit task on '二号机', then switch default to '主号' -> get_task without account still routes to '二号机'
+  const createdSub = await hooks.tool.create_video.execute({
+    account: "二号机",
+    prompt: "Sub account shot",
+    model: "sed2",
+    audio: false,
+  });
+  assert.equal(createdSub.account, "二号机");
+
+  // Switch top default in logins.json to '二号机' and verify account.selected changes
+  await writeFile(
+    join(dataDir, "logins.json"),
+    JSON.stringify([
+      { agent: "plugin:updream", home: "updream#sub2", first: true, on: true },
+      { agent: "plugin:updream", home: "updream", first: false, on: true },
+    ]),
+  );
+  const switchedAcc = await hooks.tool.account.execute({});
+  assert.deepEqual(switchedAcc.selected, { slot: "updream#sub2", label: "二号机" });
+
+  // Switch back to '主号' as default; polling createdSub.task_id without account must still hit '二号机' via task binding!
+  await writeFile(
+    join(dataDir, "logins.json"),
+    JSON.stringify([
+      { agent: "plugin:updream", home: "updream", first: true, on: true },
+      { agent: "plugin:updream", home: "updream#sub2", first: false, on: true },
+    ]),
+  );
+  const polledBound = await hooks.tool.get_task.execute({ task_id: createdSub.task_id });
+  assert.equal(polledBound.account, "二号机");
+  assert.equal(polledBound.status, "completed");
+
+  // D. Unbound historical task owned by '二号机' falls back across enabled slots when '主号' returns 404
+  tasksByToken.set("t_historic_sub_99", "sub");
+  const fallbackTask = await hooks.tool.get_task.execute({ task_id: "t_historic_sub_99" });
+  assert.equal(fallbackTask.account, "二号机");
+  assert.equal(fallbackTask.status, "completed");
+
+  // E. Explicit account: "options" selects legacy options even when UI accounts exist
+  const explicitOpt = await hooks.tool.account.execute({ account: "options" });
+  assert.equal(explicitOpt.account, "options");
+  assert.equal(explicitOpt.credits.balance_credits, "300.00");
+});
+
+test("non-Seedance models validation, payload snapshots, quality_mode, WAN_SIZE_MAP, multiframe, and boundary rejections", async (t) => {
+  const f = await startFakeUPdreamServer(t);
+  const hooks = await UPdreamPlugin(
+    {},
+    {
+      baseUrl: f.baseUrl,
+      accessToken: f.state.validAccessToken,
+      refreshToken: f.state.validRefreshToken,
+      projectId: 777,
+      tokenFile: "",
+    },
+  );
+
+  // 1. kling-v4: t2v, multiframe (3 keyframes -> image + ref_images), and ref2v combinedMin check
+  const klingT2v = await hooks.tool.create_video.execute({
+    prompt: "Cyberpunk train station",
+    model: "kling-v4",
+  });
+  assert.equal(klingT2v.params_sent.model_name, "kling-v4");
+  assert.equal(klingT2v.params_sent.generate_type, "t2v");
+  assert.equal(klingT2v.params_sent.duration, 10);
+  assert.equal(klingT2v.params_sent.resolution, "1080p");
+  assert.equal(klingT2v.params_sent.aspect_ratio, "16:9");
+  assert.equal(klingT2v.params_sent.supports_audio, undefined);
+  assert.equal(klingT2v.params_sent.sound, undefined);
+
+  const klingMf = await hooks.tool.create_video.execute({
+    prompt: "Smooth transition across three keyframes",
+    model: "kling-v4",
+    mode: "multiframe",
+    reference_images: [
+      "https://boss.hdslb.com/updream/image/k1.png",
+      "https://boss.hdslb.com/updream/image/k2.png",
+      "https://boss.hdslb.com/updream/image/k3.png",
+    ],
+  });
+  assert.equal(klingMf.params_sent.generate_type, "multiframe");
+  assert.equal(klingMf.params_sent.image, "https://boss.hdslb.com/updream/image/k1.png");
+  assert.deepEqual(klingMf.params_sent.ref_images, [
+    "https://boss.hdslb.com/updream/image/k2.png",
+    "https://boss.hdslb.com/updream/image/k3.png",
+  ]);
+  assert.equal(klingMf.params_sent.aspect_ratio, undefined);
+
+  // kling-v4 ref2v requires at least 1 image or video (audio-only rejected)
+  await assert.rejects(
+    () =>
+      hooks.tool.create_video.execute({
+        prompt: "Audio only should fail on kling-v4",
+        model: "kling-v4",
+        mode: "ref2v",
+        reference_audios: ["https://boss.hdslb.com/updream/audio/a1.mp3"],
+      }),
+    /requires at least 1 item across \[images, videos\]/,
+  );
+
+  // kling-v4 does not support native audio: true
+  await assert.rejects(
+    () =>
+      hooks.tool.create_video.execute({
+        prompt: "Native audio check",
+        model: "kling-v4",
+        audio: true,
+      }),
+    /audio: true.*not supported by model "kling-v4"/,
+  );
+
+  // 2. wan-3.0: uppercase resolution normalization, quality_mode='prime', sound=true, prompt_extend=false
+  const wan3 = await hooks.tool.create_video.execute({
+    prompt: "Ocean waves crashing at dusk",
+    model: "wan-3.0",
+    duration: 8,
+    resolution: "1080p",
+    quality_mode: "prime",
+    audio: true,
+    prompt_extend: false,
+  });
+  assert.equal(wan3.params_sent.model_name, "wan-3.0");
+  assert.equal(wan3.params_sent.resolution, "1080P");
+  assert.equal(wan3.params_sent.mode, "prime");
+  assert.equal(wan3.params_sent.sound, true);
+  assert.equal(wan3.params_sent.supports_audio, undefined);
+  assert.equal(wan3.params_sent.prompt_extend, false);
+
+  const wan3Est = await hooks.tool.estimate_credits.execute({
+    model: "wan-3.0",
+    duration: 5,
+    resolution: "720p",
+    quality_mode: "prime",
+    audio: false,
+  });
+  assert.equal(wan3Est.params_sent.quality, "720P");
+  assert.equal(wan3Est.params_sent.mode, "prime");
+  assert.equal(wan3Est.params_sent.has_sound, 0);
+
+  // 3. kling-v3-omni & kling-v3.0-std: quality_mode, ref_video single field, conditionalMax images<=4 with video, cfg_scale
+  const omniRef = await hooks.tool.create_video.execute({
+    prompt: "Character [@图片1] follows camera motion of [@视频1]",
+    model: "kling-v3-omni",
+    mode: "ref2v",
+    quality_mode: "4k",
+    reference_images: ["https://boss.hdslb.com/updream/image/c1.png"],
+    reference_videos: ["https://boss.hdslb.com/updream/video/cam.mp4"],
+    keep_original_sound: true,
+    negative_prompt: "low quality, watermark",
+  });
+  assert.equal(omniRef.params_sent.mode, "4k");
+  assert.equal(omniRef.params_sent.resolution, undefined);
+  assert.equal(omniRef.params_sent.ref_video, "https://boss.hdslb.com/updream/video/cam.mp4");
+  assert.equal(omniRef.params_sent.ref_videos, undefined);
+  assert.equal(omniRef.params_sent.sound, false, "kling-v3-omni auto-disables sound when ref_video is attached");
+  assert.equal(omniRef.params_sent.keep_original_sound, true);
+  assert.equal(omniRef.params_sent.negative_prompt, "low quality, watermark");
+
+  await assert.rejects(
+    () =>
+      hooks.tool.create_video.execute({
+        prompt: "Too many images with video",
+        model: "kling-v3-omni",
+        mode: "ref2v",
+        reference_images: ["1", "2", "3", "4", "5"].map((n) => `https://boss.hdslb.com/updream/image/${n}.png`),
+        reference_videos: ["https://boss.hdslb.com/updream/video/cam.mp4"],
+      }),
+    /maximum 4 images allowed alongside a reference video/,
+  );
+
+  const klingStd = await hooks.tool.create_video.execute({
+    prompt: "Close-up tea pouring",
+    model: "kling-v3.0-std",
+    resolution: "720p", // maps to quality_mode: "std"
+    cfg_scale: 0.7,
+    audio: false,
+  });
+  assert.equal(klingStd.params_sent.mode, "std");
+  assert.equal(klingStd.params_sent.cfg_scale, 0.7);
+  assert.equal(klingStd.params_sent.sound, false);
+
+  // 4. wan-2.6: WAN_SIZE_MAP converts quality+aspect_ratio -> size on t2v, uses resolution on i2v
+  const wan26T2v = await hooks.tool.create_video.execute({
+    prompt: "Vertical street food stall",
+    model: "wan-2.6",
+    duration: 10,
+    resolution: "1080p",
+    aspect_ratio: "9:16",
+    shot_type: "multi",
+    audio: false,
+  });
+  assert.equal(wan26T2v.params_sent.size, "1080*1920");
+  assert.equal(wan26T2v.params_sent.resolution, undefined);
+  assert.equal(wan26T2v.params_sent.aspect_ratio, undefined);
+  assert.equal(wan26T2v.params_sent.shot_type, "multi");
+
+  const wan26I2v = await hooks.tool.create_video.execute({
+    prompt: "Subtle steam rising",
+    model: "wan-2.6",
+    first_frame: "https://boss.hdslb.com/updream/image/dish.png",
+    resolution: "720p",
+    audio: false,
+  });
+  assert.equal(wan26I2v.params_sent.generate_type, "i2v");
+  assert.equal(wan26I2v.params_sent.size, undefined);
+  assert.equal(wan26I2v.params_sent.resolution, "720p");
+  assert.equal(wan26I2v.params_sent.aspect_ratio, undefined);
+
+  // 5. vidu-q4 (no t2v), hailuo-2.3 (duration=10 only allows 768P), gemini-omni-1.1-flash (i2v keeps aspect_ratio + clip2v), veo-3.1-preview
+  await assert.rejects(
+    () => hooks.tool.create_video.execute({ prompt: "No t2v on vidu-q4", model: "vidu-q4" }),
+    /Invalid 'mode' \("t2v"\) for model "vidu-q4"\. Allowed modes for vidu-q4: i2v, ref2v/,
+  );
+
+  const viduI2v = await hooks.tool.create_video.execute({
+    prompt: "Gentle breeze in hair",
+    model: "vidu-q4",
+    first_frame: "https://boss.hdslb.com/updream/image/portrait.png",
+    duration: 5,
+    resolution: "2k",
+    audio: false,
+  });
+  assert.equal(viduI2v.params_sent.resolution, "2k");
+  assert.equal(viduI2v.params_sent.supports_audio, false);
+
+  await assert.rejects(
+    () =>
+      hooks.tool.create_video.execute({
+        prompt: "Hailuo 2.3 10s 1080P invalid combo",
+        model: "hailuo-2.3",
+        duration: 10,
+        resolution: "1080p",
+      }),
+    /Invalid 'resolution' \("1080P"\) for model "hailuo-2.3" when duration=10s\. Allowed values at 10s: 768P/,
+  );
+
+  const hailuoOk = await hooks.tool.create_video.execute({
+    prompt: "Hailuo 2.3 10s 768P valid",
+    model: "hailuo-2.3",
+    duration: 10,
+    resolution: "768p",
+  });
+  assert.equal(hailuoOk.params_sent.resolution, "768P");
+  assert.equal(hailuoOk.params_sent.aspect_ratio, undefined);
+
+  const omniClip = await hooks.tool.create_video.execute({
+    prompt: "Extend scene toward sunset",
+    model: "gemini-omni-1.1-flash",
+    mode: "clip2v",
+    reference_videos: ["https://boss.hdslb.com/updream/video/src.mp4"],
+    last_frame: "https://boss.hdslb.com/updream/image/target_end.png",
+    duration: 6,
+  });
+  assert.equal(omniClip.params_sent.ref_video, "https://boss.hdslb.com/updream/video/src.mp4");
+  assert.equal(omniClip.params_sent.last_image, "https://boss.hdslb.com/updream/image/target_end.png");
+
+  const veo = await hooks.tool.create_video.execute({
+    prompt: "Aerial fjord sunrise",
+    model: "veo-3.1-preview",
+    duration: 8,
+    resolution: "1080p",
+    enhance_prompt: true,
+    audio: true,
+  });
+  assert.equal(veo.params_sent.sound, true);
+  assert.equal(veo.params_sent.enhance_prompt, true);
+
+  // 6. Reject mock/post-processing models clearly
+  await assert.rejects(
+    () => hooks.tool.create_video.execute({ prompt: "Mock", model: "test" }),
+    /Invalid 'model' "test"/,
+  );
+  await assert.rejects(
+    () => hooks.tool.create_video.execute({ prompt: "Enhance", model: "video-enhance-pro" }),
+    /post-processing utility/,
+  );
+});
